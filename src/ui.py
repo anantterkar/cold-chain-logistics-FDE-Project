@@ -2,13 +2,12 @@ import os
 import sys
 import uuid
 import json
-import urllib
+import sqlite3
 from pathlib import Path
 from dotenv import load_dotenv
 import streamlit as st
 import pandas as pd
-from sqlalchemy import create_engine, text
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 # ==========================================
 # 1. IMMEDIATE PATH & ENVIRONMENT RESOLUTION
@@ -25,41 +24,42 @@ load_dotenv(project_root / ".env")
 from src.orchestrator import fde_agent
 
 # ==========================================
-# 2. SQL CREDENTIALS MAPPING FROM .ENV
+# 2. LOCAL AUDIT DB (SQLITE)
 # ==========================================
-db_host = os.getenv("SQL_SERVER_HOST", "localhost")
-db_port = os.getenv("SQL_SERVER_PORT", "1433")
-db_user = os.getenv("SQL_AGENT_USER", "USR_FDE_RO")
-db_password = os.getenv("SQL_AGENT_PASSWORD")
+audit_db_path = project_root / "data" / "cache" / "agent_audit.db"
+audit_db_path.parent.mkdir(parents=True, exist_ok=True)
 
-# Engine for the Agent to write logs using its standard credentials
-connection_string = (
-    f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-    f"SERVER={db_host},{db_port};"
-    f"DATABASE=master;"
-    f"UID={db_user};"
-    f"PWD={db_password};"
-    f"Encrypt=no;"
-    f"TrustServerCertificate=yes;"
-)
 
-log_params = urllib.parse.quote_plus(connection_string)
+def initialize_audit_db():
+    with sqlite3.connect(audit_db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS AgentAuditLog (
+                LogID INTEGER PRIMARY KEY AUTOINCREMENT,
+                Timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                SessionID TEXT,
+                NodeExecuted TEXT,
+                ToolName TEXT,
+                Content TEXT
+            )
+            """
+        )
+        conn.commit()
 
-log_engine = create_engine(f"mssql+pyodbc:///?odbc_connect={log_params}")
+
+initialize_audit_db()
 
 def write_audit_log(session_id, node_name, tool_name, content):
-    """Silently writes agent execution traces to the SQL audit table using agent permissions."""
+    """Silently writes agent execution traces to a local SQLite audit table."""
     try:
-        with log_engine.connect() as conn:
-            conn.execute(text("""
-                INSERT INTO FDE_VIEWS.AgentAuditLog (SessionID, NodeExecuted, ToolName, Content)
-                VALUES (:session_id, :node_name, :tool_name, :content)
-            """), {
-                "session_id": session_id,
-                "node_name": node_name,
-                "tool_name": tool_name,
-                "content": content
-            })
+        with sqlite3.connect(audit_db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO AgentAuditLog (SessionID, NodeExecuted, ToolName, Content)
+                VALUES (?, ?, ?, ?)
+                """,
+                (session_id, node_name, tool_name, content),
+            )
             conn.commit()
     except Exception as e:
         print(f"Audit Log Failed (Silent): {e}")
@@ -91,7 +91,30 @@ if "thread_id" not in st.session_state:
 if "ui_messages" not in st.session_state:
     st.session_state.ui_messages = []
 
+if "is_thread_seeded" not in st.session_state:
+    st.session_state.is_thread_seeded = False
+
 thread_config = {"configurable": {"thread_id": st.session_state.thread_id}}
+
+
+def load_system_prompt() -> str:
+    prompt_path = project_root / "src" / "prompts" / "system_prompt.txt"
+    try:
+        return prompt_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "You are a helpful AI assistant."
+
+
+def ensure_thread_initialized() -> None:
+    if st.session_state.is_thread_seeded:
+        return
+
+    system_instructions = load_system_prompt()
+    fde_agent.invoke(
+        {"messages": [SystemMessage(content=system_instructions)]},
+        config=thread_config,
+    )
+    st.session_state.is_thread_seeded = True
 
 # ==========================================
 # 5. SIDEBAR NAVIGATION & METADATA
@@ -104,12 +127,13 @@ with st.sidebar:
     
     st.markdown("---")
     st.caption(f"Session Token: `{st.session_state.thread_id[:8]}...`")
-    st.markdown(f"**Reasoning Architecture:** `{os.getenv('Agent_llm', 'DEEPSEEK')}`")
+    st.markdown(f"**Reasoning Architecture:** `OLLAMA/{os.getenv('OLLAMA_MODEL', 'qwen2.5:7b')}`")
     
     st.markdown("---")
     if st.button("🗑️ Purge Dispatch Workspace Session", use_container_width=True):
         st.session_state.ui_messages = []
         st.session_state.thread_id = str(uuid.uuid4())
+        st.session_state.is_thread_seeded = False
         st.rerun()
 
 # ==========================================
@@ -122,6 +146,8 @@ if app_mode == "🧊 Dispatch Console":
     # ------------------------------------------
     st.title("Cold-Chain Incident Control Dashboard")
     st.caption("Production Data Engineering Pipeline • Real-Time Decision Optimization Platform")
+
+    ensure_thread_initialized()
 
     for entry in st.session_state.ui_messages:
         with st.chat_message(entry["role"], avatar="👤" if entry["role"] == "user" else "🤖"):
@@ -228,70 +254,48 @@ if app_mode == "🧊 Dispatch Console":
 
 elif app_mode == "🛡️ Security & Audit Logs":
     # ------------------------------------------
-    # TAB 2: AUDIT LOG VIEWER (REQUIRES ADMIN CREDENTIALS FROM .ENV OR INPUT)
+    # TAB 2: LOCAL AUDIT LOG VIEWER
     # ------------------------------------------
-    st.title("🛡️ Enterprise Agent Audit Trail")
-    st.caption("Secure database inspection of FDE_VIEWS.AgentAuditLog")
-    
-    st.markdown("### Database Authorization Gate")
-    st.markdown("Enter high-privilege administrative credentials (defined in `.env` as `SQL_ADMIN_USER`) to query audit logs.")
-    
-    with st.form("admin_auth_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            input_user = st.text_input("Admin Username", value=os.getenv("SQL_ADMIN_USER", ""))
-        with col2:
-            input_pass = st.text_input("Admin Password", type="password", value="")
-            
-        submit_admin = st.form_submit_button("Authenticate & Load Logs", use_container_width=True)
+    st.title("🛡️ Local Agent Audit Trail")
+    st.caption("Inspection of local SQLite logs in data/cache/agent_audit.db")
 
-    if submit_admin:
-        expected_admin_user = os.getenv("SQL_ADMIN_USER")
-        expected_admin_pass = os.getenv("SQL_ADMIN_PASSWORD")
-        
-        if input_user == expected_admin_user and input_pass == expected_admin_pass:
-            try:
-                # Build an isolated admin connection string for viewing data
-                admin_params = urllib.parse.quote_plus(
-                    "DRIVER={ODBC Driver 18 for SQL Server};"
-                    f"SERVER={db_host},{db_port};"
-                    "DATABASE=master;"
-                    f"UID={input_user};"
-                    f"PWD={input_pass};"
-                    "Encrypt=no;"
-                    "TrustServerCertificate=yes;"
-                )
-                admin_engine = create_engine(f"mssql+pyodbc:///?odbc_connect={admin_params}")
-                
-                with admin_engine.connect() as conn:
-                    query = """
-                        SELECT LogID, Timestamp, SessionID, NodeExecuted, ToolName, Content 
-                        FROM FDE_VIEWS.AgentAuditLog 
-                        ORDER BY Timestamp DESC
-                    """
-                    df = pd.read_sql(query, conn)
-                
-                st.success("✅ Authenticated successfully as Admin.")
-                
-                if not df.empty:
-                    st.dataframe(
-                        df,
-                        column_config={
-                            "LogID": st.column_config.NumberColumn("ID", format="%d"),
-                            "Timestamp": st.column_config.DatetimeColumn("Execution Time", format="DD/MM/YYYY-h:mm a"),
-                            "SessionID": "Session Token",
-                            "NodeExecuted": "Graph Node",
-                            "ToolName": "Tool Triggered",
-                            "Content": "Raw Payload Data"
-                        },
-                        hide_index=True,
-                        use_container_width=True,
-                        height=600
-                    )
-                else:
-                    st.info("No audit logs found in the database. Run a query in the Dispatch Console first.")
-                    
-            except Exception as e:
-                st.error(f"Database Query Failed: {e}")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.markdown("Review all tool inputs/outputs captured during this local session history.")
+    with col2:
+        if st.button("Clear Logs", use_container_width=True):
+            with sqlite3.connect(audit_db_path) as conn:
+                conn.execute("DELETE FROM AgentAuditLog")
+                conn.commit()
+            st.success("Local audit logs cleared.")
+
+    try:
+        with sqlite3.connect(audit_db_path) as conn:
+            df = pd.read_sql_query(
+                """
+                SELECT LogID, Timestamp, SessionID, NodeExecuted, ToolName, Content
+                FROM AgentAuditLog
+                ORDER BY Timestamp DESC
+                """,
+                conn,
+            )
+
+        if not df.empty:
+            st.dataframe(
+                df,
+                column_config={
+                    "LogID": st.column_config.NumberColumn("ID", format="%d"),
+                    "Timestamp": st.column_config.DatetimeColumn("Execution Time", format="DD/MM/YYYY-h:mm a"),
+                    "SessionID": "Session Token",
+                    "NodeExecuted": "Graph Node",
+                    "ToolName": "Tool Triggered",
+                    "Content": "Raw Payload Data",
+                },
+                hide_index=True,
+                use_container_width=True,
+                height=600,
+            )
         else:
-            st.error("❌ Invalid Administrator Credentials.")
+            st.info("No audit logs found yet. Run a query in Dispatch Console first.")
+    except Exception as e:
+        st.error(f"Local audit log read failed: {e}")

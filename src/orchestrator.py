@@ -27,37 +27,20 @@ class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
 # ==========================================
-# 2. FACTORY INITIALIZATION: AGENT REASONER LLM
+# 2. LOCAL REASONER INITIALIZATION (OLLAMA)
 # ==========================================
 
-AGENT_LLM_SETTING = os.getenv("Agent_llm", "OLLAMA").strip().upper()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+OLLAMA_NUM_GPU = int(os.getenv("OLLAMA_NUM_GPU", "0"))
+print(f"🤗 Brain Mode: Local Desktop (Ollama: {OLLAMA_MODEL})")
+from langchain_ollama import ChatOllama
 
-if AGENT_LLM_SETTING == "OPENAI":
-    print("🤖 Brain Mode: Utilizing Cloud OpenAI Reasoner (gpt-4o)...")
-    from langchain_openai import ChatOpenAI
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
-
-elif AGENT_LLM_SETTING == "DEEPSEEK":
-    print("🐳 Brain Mode: Utilizing Flagship DeepSeek Cloud Reasoner (deepseek-v4-pro)...")
-    from langchain_openai import ChatOpenAI
-    
-    # Fully updated to match 2026 DeepSeek API parameters and endpoint contracts
-    llm = ChatOpenAI(
-        model="deepseek-v4-flash",                           # deepseek-v4-flash, deepseek-v4-pro
-        temperature=0,
-        openai_api_key=os.getenv("DEEPSEEK_API_KEY"),
-        base_url="https://api.deepseek.com",     # Fixed connection string url endpoint
-        max_tokens=2048,                                   # Gives the deep reasoner plenty of output runway
-        # extra_body={
-        #     "thinking": {"type": "enabled"},              # Activates DeepSeek Deep-Thinking mode
-        #     "reasoning_effort": "high"                     # Drives maximal reasoning depth for logic maps
-        # }
-    )
-
-else:  # FALLBACK / DEFAULT RUNNER MODE
-    print("🤗 Brain Mode: Local Fallback Activated. Binding Local Ollama (qwen2.5:7b)...")
-    from langchain_community.chat_models import ChatOllama
-    llm = ChatOllama(model="qwen2.5:7b", temperature=0, num_predict=1024)
+llm = ChatOllama(
+    model=OLLAMA_MODEL,
+    temperature=0,
+    num_predict=1024,
+    num_gpu=OLLAMA_NUM_GPU,
+)
 
 fde_tools = [query_telemetry_db, fetch_corridor_conditions, search_compliance_sop]
 llm_with_tools = llm.bind_tools(fde_tools)
@@ -86,7 +69,7 @@ fde_agent = graph_builder.compile(checkpointer=MemorySaver())
 if __name__ == "__main__":
     print("\n" + "="*55)
     print("🚀 FDE Supply Chain Orchestrator State Machine Online")
-    print(f"   Configured Execution: [LLM: {AGENT_LLM_SETTING}] -> [Embeddings: {os.getenv('Embeddings_model', 'LOCAL')}]")
+    print(f"   Configured Execution: [LLM: OLLAMA/{OLLAMA_MODEL}] -> [Embeddings: LOCAL]")
     print("="*55 + "\n")
     
     # Load the business-structured system prompt from the external file
